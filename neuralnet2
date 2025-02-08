@@ -1,0 +1,238 @@
+# load libraries
+install.packages("tidyverse")
+install.packages("GGally")
+install.packages("caret")
+install.packages("neuralnet")
+install.packages("dplyr")
+install.packages("fastDummies")
+install.packages("sigmoid")
+
+library(tidyverse)
+library(GGally) # for data exploration
+library(caret) #For confusionMatrix(), training ML models, and more
+library(neuralnet) #For neuralnet() function
+library(dplyr) #For some data manipulation and ggplot
+library(fastDummies) #To create dummy variable (one hot encoding)
+library(sigmoid) #For the relu activation function
+
+# set a random seed for reproducibility
+
+### Load Data ----
+airbnb <- read_csv("AirbnbListings.csv")
+
+# check data structure
+str(airbnb)
+
+set.seed(123)  # For reproducibility
+train_indices <- sample(1:nrow(airbnb), 0.8 * nrow(airbnb))  # 80% training, 20% test
+train_data <- airbnb[train_indices, ]
+test_data <- airbnb[-train_indices, ]
+
+
+train_data <- train_data |>
+  dummy_cols(
+    select_columns = c('room_type', 'neighborhood', 'bathrooms', 'superhost'),
+    remove_selected_columns = TRUE,
+    remove_first_dummy = TRUE
+  )
+
+test_data <- test_data |>
+  dummy_cols(
+    select_columns = c('room_type', 'neighborhood', 'bathrooms', 'superhost'),
+    remove_selected_columns = TRUE,
+    remove_first_dummy = TRUE
+  )
+
+train_data <- train_data |>
+  mutate(
+    host_since = as.Date(host_since, format = "%m/%d/%Y"),
+    year = as.numeric(format(host_since, '%Y')),
+    month = as.numeric(format(host_since, '%m')),
+    day = as.numeric(format(host_since, '%d')),
+    day_of_week = as.numeric(format(host_since, '%u')),
+    day_of_year = as.numeric(format(host_since, '%j'))
+  ) |>
+  select(-host_since)
+
+test_data <- test_data |>
+  mutate(
+    host_since = as.Date(host_since, format = "%m/%d/%Y"),
+    year = as.numeric(format(host_since, '%Y')),
+    month = as.numeric(format(host_since, '%m')),
+    day = as.numeric(format(host_since, '%d')),
+    day_of_week = as.numeric(format(host_since, '%u')),
+    day_of_year = as.numeric(format(host_since, '%j'))
+  ) |>
+  select(-host_since)
+
+missing_cols <- setdiff(colnames(train_data), colnames(test_data))
+
+test_data[missing_cols] <- 0
+
+test_data <- test_data[, colnames(train_data)]
+
+str(train_data)
+
+str(test_data)
+
+### Step 1: Create a train/test split ----
+z_scores_train <- scale(train_data$price)
+threshold <- 3
+train_data <- train_data[abs(z_scores_train) < threshold, ]
+
+mean_price <- mean(train_data$price, na.rm = TRUE)
+sd_price <- sd(train_data$price, na.rm = TRUE)
+z_scores_test <- (test_data$price - mean_price) / sd_price
+test_data <- test_data[abs(z_scores_test) < threshold, ]
+
+# Step 2: Data Exploration
+train_data |> is.na() |> colSums()
+test_data |> is.na() |> colSums()
+train_data <- na.omit(train_data)
+test_data <- na.omit(test_data)
+# Step 3: Data Preprocessing
+normalizer <- preProcess(
+  train_data |> select(where(function(x) !is.integer(x) & !is.factor(x)), -price),
+  method = "range"
+)
+train_data_normalized <- predict(normalizer, train_data)
+test_data_normalized <- predict(normalizer, test_data)
+train_data_normalized$price <- train_data$price
+test_data_normalized$price <- test_data$price
+
+# Step 4: Feature Engineering
+colnames(train_data_normalized) <- make.names(colnames(train_data_normalized))
+colnames(test_data_normalized) <- make.names(colnames(test_data_normalized))
+predictors <- colnames(train_data_normalized)[colnames(train_data_normalized) != "price"]
+formula <- as.formula(paste("price ~", paste(predictors, collapse = " +")))
+print(formula)
+colnames(train_data_normalized) <- gsub(" ", "_", colnames(train_data_normalized))
+colnames(test_data_normalized) <- gsub(" ", "_", colnames(test_data_normalized))
+
+# Step 5: Remove Rows with Any 0s
+train_data_normalized <- train_data_normalized[rowSums(train_data_normalized == 0) == 0, ]
+test_data_normalized <- test_data_normalized[rowSums(test_data_normalized == 0) == 0, ]
+
+# Step 6: Increase Memory Limit
+memory.limit(size = 64000)
+dim(train_data)
+dim(test_data)
+train_data |> is.na() |> colSums()
+test_data |> is.na() |> colSums()
+
+set.seed(123)
+nn1 <- neuralnet(
+  price ~ .,
+  data = train_data_normalized,
+  hidden = 5,
+  linear.output = TRUE,
+  stepmax = 1e6
+)
+
+print(colnames(train_data))
+str(train_data)
+colSums(train_data)
+plot(nn1)
+print(nn1)
+
+
+
+
+# Train a second neural net using caret with the 'nnet' method.
+# use 10-fold cross validation and a grid search:
+# size from 1 to 10 and decay between 0.01 and 0.2
+# What's the best size and decay?
+
+nn2 <- train(
+  price ~.,
+  data = train_data_normalized,
+  method = "nnet",
+  linout = TRUE,
+  trace = FALSE,
+  maxit = 500,
+  trControl = trainControl( # store since we will reuse
+    method = "cv", number = 10, returnResamp = "all", verboseIter = TRUE
+  ),
+  tuneGrid = expand.grid(
+    size = 1:10, 
+    decay = c(0.01,0.05,0.1,0.15, 0.2)
+  ),
+  metric = "RMSE",
+)
+sum(is.na(train_data_normalized))
+sum(is.na(test_data_normalized))
+plot(nn2)
+print(nn2)
+nn2$bestTune
+
+final_nn <- train(
+  price ~ .,
+  data = train_data_normalized,
+  method = "nnet",
+  linout = TRUE,
+  trace = FALSE,
+  maxit = 500,
+  trControl = trainControl(
+    method = "cv", number = 10, returnResamp = "all", verboseIter = TRUE
+  ),
+  tuneGrid = expand.grid(
+    size = 9, 
+    decay = 0.15
+  ),
+  metric = "RMSE"
+)
+# Print the final model
+print(final_nn)
+
+### Step 6: Model Validation ----
+# skipping for brevity
+
+### Step 7: Predictions and Conclusions ----
+
+# get predictions from both models
+p1 <- predict(nn1, test_data_normalized)
+
+p2 <- predict(nn2, test_data_normalized)
+
+p3 <- predict(final_nn, test_data_normalized)
+
+# if you normalized price, convert predictions back to dollars
+
+# calculate r-squared using either mvrsquared::calc_rsquared or caret::R2
+predictions_dollars <- (p1 * sd(test_data$price)) + mean(test_data$price)
+# calculate RMSE and MAE (check caret for these functions)
+summary(predictions_dollars)
+results <- tibble(
+  model = c("neuralnet", "caret-nnet"),
+  r2 = c(R2(test_data$price, p1[,1]), R2(test_data$price, p2)),
+  rmse = c(RMSE(test_data$price, p1[,1]), RMSE(test_data$price, p2)),
+  mae = c(MAE(test_data$price, p1[,1]), MAE(test_data$price, p2)),
+)
+
+results
+summary(test_data$price)
+
+
+
+# plot the original price versus the predicted price for both models
+predictions <- 
+  tibble(
+    neuralnet = p1[,1],
+    caret = p2,
+    actual = test_data$Price
+  ) |>
+  pivot_longer(
+    all_of(c("neuralnet", "caret")),
+    names_to = "model",
+    values_to = "prediction"
+  )
+
+predictions |>
+  ggplot(aes(x = prediction, y = actual, color = model)) + 
+  geom_point(alpha = 0.5) +
+  facet_wrap(~model, nrow = 2) +
+  theme(legend.position = "none")
+
+# which model do you think works better?
+
+# neuralnet by a mile. 
